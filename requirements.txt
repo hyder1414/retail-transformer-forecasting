@@ -1,0 +1,28 @@
+numpy>=1.26
+pandas>=2.2
+pyarrow>=17.0
+polars>=1.7
+duckdb>=1.1.0
+scikit-learn>=1.5
+statsmodels>=0.14
+matplotlib>=3.9
+holidays>=0.56
+
+# torch: CPU wheels available on macOS up to 2.2.x
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+pytorch-lightning>=2.4
+
+
+# boosting baselines
+xgboost>=2.1
+lightgbm>=4.5
+
+# experiment tracking
+mlflow>=2.16
+
+# config & utils
+pyyaml>=6.0
+pydantic>=2.9
+tqdm>=4.66
