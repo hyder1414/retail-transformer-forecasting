@@ -1,25 +1,31 @@
 # data preprocessing.py
-"""
-preprocessing for Walmart store sales transformer model.
-Main entry point:
-    prepare_walmart_data(
-        seq_len=16,
-        horizon=4,
-        data_dir="cache",
-        force_recompute=False)
-
-Output:
-    X: np.ndarray, shape (num_samples, seq_len, num_features)
-    y: np.ndarray, shape (num_samples, horizon)
-    scaler: fitted sklearn StandardScaler for continuous features
-    feature_columns: list of feature names in the same order as X 
-"""
 from pathlib import Path
 import numpy as np
 import joblib
 from typing import Tuple, List
 from sklearn.preprocessing import StandardScaler
 import pandas as pd
+
+
+"""
+This is preprocessing for the Walmart data
+Main entry points:
+    prepare_walmart_data(
+        seq_len=16,
+        horizon=4,
+        data_dir="cache",
+        force_recompute=False)
+Output:
+    X: np.ndarray, shape (num_samples, seq_len, num_features)
+    y: np.ndarray, shape (num_samples, horizon)
+    scaler: fitted sklearn StandardScaler for continuous features
+    feature_columns: list of feature names in the same order as X 
+    To load the data use main entry point params as default and
+    def main():
+        X, y, scaler, feature_cols = prepare_walmart_data(...
+    should do.
+"""
+
 #Load  CSVs
 def _load_raw_walmart_data(base_dir: str = ".") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     #Checking for cached data
@@ -82,7 +88,6 @@ def _engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Stand
         source_col = "Weekly_Sales_Clipped"
     else:
         source_col = "Weekly_Sales"
-
     df["Weekly_Sales_Log"] = np.log1p(df[source_col])
 
     # Ensure MarkDown columns nans
