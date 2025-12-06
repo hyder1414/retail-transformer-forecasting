@@ -1,25 +1,25 @@
-# OS / IDE
-.DS_Store
-.vscode/
-.ipynb_checkpoints/
-
 # Python
 __pycache__/
-*.pyc
-.venv/
-.env
+*.py[cod]
+*.pyo
+*.pyd
 
-# Data / artifacts
-data/*
-!data/.gitkeep
-reports/figures/*
-reports/metrics/*
-experiments/*
-
-# Model junk
-lightning_logs/
-mlruns/
-
+# Virtual environments
 venv/
 
-venv/
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (raw + intermediate + external + processed)
+data/raw/
+data/interim/
+data/processed/
+data/external/
+
+# Experiments / outputs
+experiments/
+reports/metrics/
+reports/figures/
+
+# OS
+.DS_Store

@@ -3,9 +3,9 @@ pandas>=2.2
 pyarrow>=17.0
 polars>=1.7
 duckdb>=1.1.0
-scikit-learn>=1.5
+scikit-learn>=1.4
 statsmodels>=0.14
-matplotlib>=3.9
+matplotlib>=3.8
 holidays>=0.56
 
 # torch: CPU wheels available on macOS up to 2.2.x
