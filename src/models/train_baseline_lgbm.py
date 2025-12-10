@@ -1,7 +1,6 @@
-# this is XGBoost
+# src/models/train_baseline_lgbm.py
 
 from math import sqrt
-from pathlib import Path
 
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -40,9 +39,9 @@ def main():
     )
 
     model = XGBRegressor(
-        n_estimators=500,
+        n_estimators=300,
         learning_rate=0.05,
-        max_depth=8,
+        max_depth=3,
         subsample=0.8,
         colsample_bytree=0.8,
         objective="reg:squarederror",
@@ -86,8 +85,6 @@ def main():
     print(f"Loading original joined data from: {joined_path}")
     joined = pd.read_parquet(joined_path)
 
-    # In case joined has more rows than df_feat (due to lag/roll NaNs),
-    # merge on (Store, Dept, Date). Early weeks just get NaN Baseline_Pred.
     merged = joined.merge(
         df[["Store", "Dept", "Date", "Baseline_Pred"]],
         on=["Store", "Dept", "Date"],

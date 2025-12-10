@@ -20,7 +20,7 @@ class TrainConfig:
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    # Apple Silicon (if you have M1/M2/M3)
+    # Apple Silicon (M1/M2/M3)
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -34,18 +34,34 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
 ):
+    """
+    Train for one epoch using holiday-weighted MSE in log1p space.
+    """
     model.train()
     running_loss = 0.0
     n_batches = 0
     total_batches = len(train_loader)
 
-    for batch_idx, (xb, yb) in enumerate(train_loader):
+    for batch_idx, (xb, yb, hb) in enumerate(train_loader):
         xb = xb.to(device)  # (B, L, F)
-        yb = yb.to(device)  # (B, H)
+        yb = yb.to(device)  # (B, H)   log1p(target)
+        hb = hb.to(device)  # (B,)     0.0 or 1.0 holiday flag
 
         optimizer.zero_grad()
-        preds = model(xb)   # (B, H)
-        loss = criterion(preds, yb)
+        preds = model(xb)   # (B, H) in log1p space
+
+        # per-output MSE in log space: shape (B, H)
+        loss_per_h = criterion(preds, yb)          # (B, H)
+
+        # average across horizon → per-sample loss: shape (B,)
+        loss_per_sample = loss_per_h.mean(dim=1)   # (B,)
+
+        # holiday weighting: 5x for holiday, 1x otherwise
+        weights = 1.0 + 4.0 * hb                   # (B,)
+
+        # weighted average over batch (scalar)
+        loss = (weights * loss_per_sample).mean()
+
         loss.backward()
         optimizer.step()
 
@@ -66,7 +82,6 @@ def train_one_epoch(
     return avg_loss
 
 
-
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -75,46 +90,72 @@ def evaluate(
     device: torch.device,
     split_name: str = "val",
 ):
+    """
+    Evaluate model:
+      - avg MSE in log space (MSE_log)
+      - RMSE, MAE, WMAE in original sales dollars
+    """
     model.eval()
     running_loss = 0.0
     n_batches = 0
 
     all_preds = []
     all_targets = []
+    all_holidays = []
 
-    for xb, yb in loader:
+    for xb, yb, hb in loader:
         xb = xb.to(device)
-        yb = yb.to(device)  # yb is log1p(Weekly_Sales)
+        yb = yb.to(device)  # log1p(target)
+        hb = hb.to(device)  # 0.0 or 1.0
 
-        preds = model(xb)   # preds are also in log1p space
-        loss = criterion(preds, yb)
+        preds = model(xb)   # (B, H) in log1p space
 
-        running_loss += loss.item()
+        # criterion gives (B, H) because reduction="none"
+        loss_per_h = criterion(preds, yb)       # (B, H)
+        loss_batch = loss_per_h.mean()          # scalar
+        running_loss += loss_batch.item()
         n_batches += 1
 
         all_preds.append(preds.cpu())
         all_targets.append(yb.cpu())
+        all_holidays.append(hb.cpu())
 
     avg_mse_log = running_loss / max(n_batches, 1)
 
-    preds_full = torch.cat(all_preds, dim=0)
-    targets_full = torch.cat(all_targets, dim=0)
+    preds_full = torch.cat(all_preds, dim=0)        # (N, H)
+    targets_full = torch.cat(all_targets, dim=0)    # (N, H)
+    holidays_full = torch.cat(all_holidays, dim=0)  # (N,)
 
-    # convert back to original sales space for metrics
+    # back to original sales (undo log1p)
     preds_orig = torch.expm1(preds_full)
     targets_orig = torch.expm1(targets_full)
 
+    # MAE / RMSE in dollars
     mae = torch.mean(torch.abs(preds_orig - targets_orig)).item()
     rmse = torch.sqrt(torch.mean((preds_orig - targets_orig) ** 2)).item()
 
+    # WMAE: 5x for holiday, 1x otherwise
+    weights = torch.where(
+        holidays_full > 0.5,
+        torch.tensor(5.0),
+        torch.tensor(1.0),
+    )  # (N,)
+
+    # mean absolute error per sample across horizon
+    ae_per_sample = torch.mean(
+        torch.abs(preds_orig - targets_orig),
+        dim=1,  # average over H
+    )  # (N,)
+
+    wmae = (weights * ae_per_sample).sum().item() / weights.sum().item()
+
     print(
         f"{split_name}_metrics: "
-        f"MSE_log={avg_mse_log:.4f}, RMSE={rmse:.2f}, MAE={mae:.2f}"
+        f"MSE_log={avg_mse_log:.4f}, RMSE={rmse:.2f}, "
+        f"MAE={mae:.2f}, WMAE={wmae:.2f}"
     )
 
-    return avg_mse_log, rmse, mae
-
-
+    return avg_mse_log, rmse, mae, wmae
 
 
 def main():
@@ -145,63 +186,10 @@ def main():
     )
 
     model = TimeSeriesTransformer(model_cfg).to(device)
-    criterion = nn.MSELoss()
-    optimizer = Adam(
-        model.parameters(),
-        lr=train_cfg.lr,
-        weight_decay=train_cfg.weight_decay,
-    )
 
-    print("Starting training...")
-    for epoch in range(1, train_cfg.max_epochs + 1):
-        train_one_epoch(
-            model,
-            train_loader,
-            criterion,
-            optimizer,
-            device,
-            epoch,
-        )
-        evaluate(
-            model,
-            val_loader,
-            criterion,
-            device,
-            split_name="val",
-        )
+    # IMPORTANT: reduction="none" to support weighting
+    criterion = nn.MSELoss(reduction="none")
 
-    print("Final evaluation on test set:")
-    evaluate(
-        model,
-        test_loader,
-        criterion,
-        device,
-        split_name="test",
-    )
-
-    train_cfg = TrainConfig()
-    model_cfg = TransformerConfig(
-        input_length=52,
-        output_length=4,
-        feature_dim=18,
-        d_model=64,
-        nhead=4,
-        num_layers=4,
-        dim_feedforward=128,
-        dropout=0.1,
-    )
-
-    device = get_device()
-    print("Using device:", device)
-
-    print("Creating dataloaders...")
-    train_loader, val_loader, test_loader = create_dataloaders(
-        batch_size=train_cfg.batch_size,
-        num_workers=train_cfg.num_workers,
-    )
-
-    model = TimeSeriesTransformer(model_cfg).to(device)
-    criterion = nn.MSELoss()
     optimizer = Adam(
         model.parameters(),
         lr=train_cfg.lr,

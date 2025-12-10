@@ -1,43 +1,52 @@
-#This just centralizes “what is time / id / target / features” and the input_length / output_length
-
 from dataclasses import dataclass
 from typing import List
 
 
 @dataclass
 class DataConfig:
-    time_col: str = "Date"
-    id_cols: List[str] = ("Store", "Dept")
+    # time-series structure
+    date_col: str = "Date"
     target_col: str = "Weekly_Sales"
+    group_cols: List[str] = None
+    input_length: int = 52
+    output_length: int = 4
+    min_history: int = 60  # min rows per (Store, Dept) to form windows
 
-    # sequence lengths
-    input_length: int = 52   # use 52 weeks of history
-    output_length: int = 4   # predict next 4 weeks
+    # base feature columns in joined dataset
+    # NOTE: we add Type_id, Store_id, Dept_id later in prepare_features
+    base_feature_cols: List[str] = None
 
-    # which features go into the model
-    # we'll filter to only existing cols later
-    base_feature_cols: List[str] = (
-        "Weekly_Sales",    # past target (will be normalized)
+
+# default config used across the project
+CONFIG = DataConfig(
+    group_cols=["Store", "Dept"],
+    input_length=52,
+    output_length=4,
+    min_history=60,
+    base_feature_cols=[
+        # past target as a feature
+        "Weekly_Sales",
+        # numeric covariates
         "Temperature",
         "Fuel_Price",
         "CPI",
         "Unemployment",
+        # binary flags
         "IsHoliday",
+        # markdowns
         "MarkDown1",
         "MarkDown2",
         "MarkDown3",
         "MarkDown4",
         "MarkDown5",
+        # store-level
         "Size",
-        # "Type",  # <- leave this commented or removed
+        # calendar features
         "year",
         "month",
         "weekofyear",
         "dayofweek",
+        # weather-derived feature
         "temp_anomaly",
-    )
-
-
-
-
-CONFIG = DataConfig()
+    ],
+)

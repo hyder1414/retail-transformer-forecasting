@@ -17,7 +17,7 @@ pytorch-lightning>=2.4
 
 # boosting baselines
 xgboost>=2.1
-lightgbm>=4.5
+
 
 # experiment tracking
 mlflow>=2.16
