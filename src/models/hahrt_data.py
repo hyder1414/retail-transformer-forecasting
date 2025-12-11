@@ -176,10 +176,10 @@ def train_gbdt_and_compute_residuals(
 
     # Gradient Boosting baseline (tree-based, like LightGBM but pure scikit-learn)
     model = GradientBoostingRegressor(
-        n_estimators=500,
+        n_estimators=300,
         learning_rate=0.05,
         max_depth=3,
-        subsample=0.9,
+        subsample=0.8,
         max_features=0.9,
         random_state=42,
     )

@@ -7,37 +7,26 @@ __pycache__/
 # Virtual environments
 venv/
 .venv/
-__pycache__/
-*.pyc
 
 # Jupyter
 .ipynb_checkpoints/
 
-# Data (raw + intermediate + external + processed)
-data/raw/
-data/interim/
-data/processed/
-data/external/
-data/interim/*.parquet
-data/interim/*.pt
-data/interim/*.pth
-data/raw/*.zip
-data/raw/*.csv
-data/interim/*
-data/processed/*
+# OS files
+.DS_Store
+
+# DO NOT ignore model artifacts — you want these pushed
+# So remove rules like *.pt, *.parquet, etc.
+
+# Ignore only temporary experiment outputs (not your main saved models)
 reports/figures/*
 reports/metrics/*
 
-# Models / checkpoints
-*.pt
-*.pth
+# Ignore VERY large artifacts you don't want by mistake
+data/external/
+data/raw/*.zip
 
-# Experiments / outputs
-experiments/
-reports/metrics/
-reports/figures/
-
-# OS
-.DS_Store
-main
-
+# Allow raw + intermediate + processed data to be tracked
+# (do NOT ignore data folders — your teammates need these)
+#! data/raw/
+#! data/interim/
+#! data/processed/
