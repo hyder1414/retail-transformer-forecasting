@@ -1,7 +1,7 @@
 import os
 import sys
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -9,36 +9,163 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
+import math
 
-# Absolute base directory
+# ============================================================
+# PATH CONFIG
+# ============================================================
 BASE_DIR = "/content/drive/MyDrive/walmart-recruiting-store-sales-forecasting"
-
-# Make sure we can import from src/
-if BASE_DIR not in sys.path:
-    sys.path.append(BASE_DIR)
-
-from src.models.spatiotemporal_transformer import (
-    SpatioTemporalConfig,
-    SpatioTemporalTransformer,
-)
-
-# ============================================================
-# CONFIG
-# ============================================================
 CSV_PATH = os.path.join(BASE_DIR, "train_merged.csv")
 
+# ============================================================
+# MODEL DEFINITIONS
+# ============================================================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        pe = pe.unsqueeze(0)  # (1, L, D)
+
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L, D)
+        x = x + self.pe[:, : x.size(1), :]
+        return self.dropout(x)
+
+
+@dataclass
+class SpatioTemporalConfig:
+    enc_input_length: int = 30
+    dec_output_length: int = 4
+
+    enc_feature_dim: int = 11   # overridden at runtime
+    dec_feature_dim: int = 10   # overridden at runtime
+
+    d_model: int = 128
+    nhead: int = 8
+    num_encoder_layers: int = 2
+    num_decoder_layers: int = 2
+    dim_feedforward: int = 256
+    dropout: float = 0.1
+
+    static_embed_dim: int = 16
+
+
+class SpatioTemporalTransformer(nn.Module):
+    """
+    Encoder–decoder Transformer with static Store/Dept/Type embeddings.
+    """
+
+    def __init__(
+        self,
+        cfg: SpatioTemporalConfig,
+        static_vocab_sizes: Dict[str, int],
+        static_cols_order: List[str],
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.static_cols_order = static_cols_order
+
+        # Static embeddings per categorical static feature
+        self.static_embeddings = nn.ModuleDict()
+        for col, vocab_size in static_vocab_sizes.items():
+            self.static_embeddings[col] = nn.Embedding(
+                num_embeddings=vocab_size,
+                embedding_dim=cfg.static_embed_dim,
+            )
+
+        total_static_dim = cfg.static_embed_dim * len(static_vocab_sizes)
+        self.static_proj = nn.Linear(total_static_dim, cfg.d_model)
+
+        # Project dynamic + static into model dimension
+        self.enc_proj = nn.Linear(cfg.enc_feature_dim + cfg.d_model, cfg.d_model)
+        self.dec_proj = nn.Linear(cfg.dec_feature_dim + cfg.d_model, cfg.d_model)
+
+        self.enc_pos = PositionalEncoding(cfg.d_model, cfg.dropout)
+        self.dec_pos = PositionalEncoding(cfg.d_model, cfg.dropout)
+
+        self.transformer = nn.Transformer(
+            d_model=cfg.d_model,
+            nhead=cfg.nhead,
+            num_encoder_layers=cfg.num_encoder_layers,
+            num_decoder_layers=cfg.num_decoder_layers,
+            dim_feedforward=cfg.dim_feedforward,
+            dropout=cfg.dropout,
+            batch_first=True,
+        )
+
+        self.head = nn.Linear(cfg.d_model, 1)
+
+    def _static_repr(self, static_idx: torch.Tensor) -> torch.Tensor:
+        # static_idx: (B, num_static)
+        embs = []
+        for i, col in enumerate(self.static_cols_order):
+            emb_layer = self.static_embeddings[col]
+            emb = emb_layer(static_idx[:, i])  # (B, static_embed_dim)
+            embs.append(emb)
+        static_concat = torch.cat(embs, dim=-1)  # (B, total_static_dim)
+        static_repr = self.static_proj(static_concat)  # (B, d_model)
+        return static_repr
+
+    def forward(
+        self,
+        enc_x: torch.Tensor,       # (B, L_enc, F_enc)
+        dec_x: torch.Tensor,       # (B, L_dec, F_dec)
+        static_idx: torch.Tensor,  # (B, num_static)
+    ) -> torch.Tensor:
+        B, L_enc, _ = enc_x.shape
+        _, L_dec, _ = dec_x.shape
+        device = enc_x.device
+
+        static_vec = self._static_repr(static_idx)           # (B, d_model)
+        static_enc = static_vec.unsqueeze(1).expand(B, L_enc, -1)
+        static_dec = static_vec.unsqueeze(1).expand(B, L_dec, -1)
+
+        enc_in = torch.cat([enc_x, static_enc], dim=-1)
+        dec_in = torch.cat([dec_x, static_dec], dim=-1)
+
+        enc_in = self.enc_proj(enc_in)
+        dec_in = self.dec_proj(dec_in)
+
+        enc_in = self.enc_pos(enc_in)
+        dec_in = self.dec_pos(dec_in)
+
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(L_dec).to(device)
+
+        out = self.transformer(enc_in, dec_in, tgt_mask=tgt_mask)  # (B, L_dec, D)
+        out = self.head(out).squeeze(-1)                           # (B, L_dec)
+        return out
+
+
+# ============================================================
+# TRAIN CONFIG & FEATURE LISTS
+# ============================================================
 # Encoder dynamic features (PAST) – target not included
 enc_dyn_cols = [
     "Temperature", "Fuel_Price",
     "MarkDown1", "MarkDown2", "MarkDown3", "MarkDown4", "MarkDown5",
-    "CPI", "Unemployment", "IsHoliday",
+    "CPI", "Unemployment",
+    "IsHoliday",
+    "DayOfWeek", "WeekOfYear",
 ]
 
 # Decoder dynamic features (FUTURE covariates)
 dec_dyn_cols = [
     "Temperature", "Fuel_Price",
     "MarkDown1", "MarkDown2", "MarkDown3", "MarkDown4", "MarkDown5",
-    "CPI", "Unemployment", "IsHoliday",
+    "CPI", "Unemployment",
+    "IsHoliday",
+    "DayOfWeek", "WeekOfYear",
 ]
 
 # Index of IsHoliday inside decoder features (for WMAE weights)
@@ -47,8 +174,8 @@ ISHOLIDAY_IDX = dec_dyn_cols.index("IsHoliday")
 static_cat_cols = ["Store", "Dept", "Type"]
 group_cols = ["Store", "Dept"]
 
-# Fewer windows for faster experimentation
-MAX_WINDOWS = 20000
+# Use FULL dataset: no subsampling
+MAX_WINDOWS = 0   # 0 or None → use all windows
 
 
 @dataclass
@@ -56,7 +183,7 @@ class TrainConfig:
     batch_size: int = 256
     lr: float = 1e-4
     weight_decay: float = 1e-4
-    max_epochs: int = 30
+    max_epochs: int = 20
     num_workers: int = 0
     log_sales: bool = True   # use log1p(target)
 
@@ -159,7 +286,14 @@ def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def train_one_epoch(model, loader, criterion, optim, device, epoch):
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optim: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+) -> float:
     model.train()
     total = 0.0
     for enc_x, dec_x, static_idx, y in loader:
@@ -181,20 +315,28 @@ def train_one_epoch(model, loader, criterion, optim, device, epoch):
         optim.step()
 
         total += loss.item()
-    print(f"Epoch {epoch}: train_loss={total/len(loader):.4f}")
+
+    avg_loss = total / len(loader)
+    print(f"Epoch {epoch}: train_loss={avg_loss:.4f}")
+    return avg_loss
 
 
-def evaluate(model, loader, criterion, device, name: str, log_sales: bool):
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    name: str,
+    log_sales: bool,
+) -> Tuple[float, float]:
     """
     Evaluate in log-space for the loss, but report WMAE in original sales units.
-
-    Kaggle WMAE:
-        w_i = 5 if IsHoliday_i == 1, else 1
-        WMAE = sum_i w_i * |y_i - yhat_i| / sum_i w_i
+    Returns:
+        avg_loss, wmae
     """
     if len(loader) == 0:
         print(f"{name}: NO BATCHES")
-        return
+        return float("nan"), float("nan")
 
     model.eval()
     total_loss = 0.0
@@ -232,8 +374,10 @@ def evaluate(model, loader, criterion, device, name: str, log_sales: bool):
 
     abs_err = torch.abs(p - t)
     wmae = (w * abs_err).sum().item() / w.sum().item()
+    avg_loss = total_loss / len(loader)
 
-    print(f"{name}: loss={total_loss/len(loader):.4f}, WMAE={wmae:.2f}")
+    print(f"{name}: loss={avg_loss:.4f}, WMAE={wmae:.2f}")
+    return avg_loss, wmae
 
 
 # ============================================================
@@ -261,6 +405,7 @@ def main():
         "Temperature", "Fuel_Price",
         "MarkDown1","MarkDown2","MarkDown3","MarkDown4","MarkDown5",
         "CPI","Unemployment",
+        "DayOfWeek","WeekOfYear",
     ]
     for col in num_cols_to_scale:
         if col in df.columns:
@@ -270,17 +415,17 @@ def main():
                 std = 1.0
             df[col] = (df[col] - mean) / std
 
-    # Model config
+    # Model config – wide model
     cfg = SpatioTemporalConfig(
         enc_input_length=30,
         dec_output_length=4,
         enc_feature_dim=len(enc_dyn_cols),
         dec_feature_dim=len(dec_dyn_cols),
-        d_model=64,
-        nhead=4,
+        d_model=128,
+        nhead=8,
         num_encoder_layers=2,
         num_decoder_layers=2,
-        dim_feedforward=128,
+        dim_feedforward=256,
         dropout=0.1,
     )
 
@@ -292,16 +437,16 @@ def main():
         log_sales=cfg_train.log_sales,
     )
 
-    print("TOTAL windows (before subsample):", len(base_ds))
+    print("TOTAL windows:", len(base_ds))
 
-    # Subsample for speed
-    if len(base_ds) > MAX_WINDOWS:
+    # Use full dataset (no subsampling)
+    if MAX_WINDOWS and len(base_ds) > MAX_WINDOWS:
         idx = torch.randperm(len(base_ds))[:MAX_WINDOWS]
         full_ds = Subset(base_ds, idx)
         print("Subsampled windows:", len(full_ds))
     else:
         full_ds = base_ds
-        print("No subsampling applied.")
+        print("Using all windows (no subsampling).")
 
     # Train/val/test split
     n = len(full_ds)
@@ -348,23 +493,33 @@ def main():
         lr=cfg_train.lr,
         weight_decay=cfg_train.weight_decay,
     )
-    # L1 loss (MAE) in log-space
-    criterion = nn.L1Loss()
-
-    # LR scheduler: decay LR every 10 epochs
+    criterion = nn.L1Loss()  # L1 in log-space
     scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size=10, gamma=0.5)
+
+    # Best-epoch tracking
+    best_val_wmae = float("inf")
+    best_epoch = -1
+    best_ckpt_path = os.path.join(BASE_DIR, "spatiotemporal_transformer_best.pt")
 
     for epoch in range(1, cfg_train.max_epochs + 1):
         train_one_epoch(model, train_loader, criterion, optim, device, epoch)
-        evaluate(model, val_loader, criterion, device, "VAL", cfg_train.log_sales)
+        _, val_wmae = evaluate(model, val_loader, criterion, device, "VAL", cfg_train.log_sales)
         scheduler.step()
 
-    print("===== FINAL TEST =====")
-    evaluate(model, test_loader, criterion, device, "TEST", cfg_train.log_sales)
+        if val_wmae < best_val_wmae:
+            best_val_wmae = val_wmae
+            best_epoch = epoch
+            torch.save(model.state_dict(), best_ckpt_path)
+            print(f"--> New best model at epoch {epoch}: VAL WMAE={val_wmae:.2f}")
 
-    ckpt_path = os.path.join(BASE_DIR, "spatiotemporal_transformer_small.pt")
-    torch.save(model.state_dict(), ckpt_path)
-    print(f"Saved checkpoint → {ckpt_path}")
+    # Load best model before final test evaluation
+    print(f"\nLoading best model from epoch {best_epoch} with VAL WMAE={best_val_wmae:.2f}")
+    model.load_state_dict(torch.load(best_ckpt_path, map_location=device))
+
+    print(f"===== FINAL TEST (best epoch {best_epoch}) =====")
+    test_loss, test_wmae = evaluate(model, test_loader, criterion, device, "TEST", cfg_train.log_sales)
+    print(f"Final TEST: loss={test_loss:.4f}, WMAE={test_wmae:.2f}")
+    print(f"Best checkpoint saved → {best_ckpt_path}")
 
 
 if __name__ == "__main__":
