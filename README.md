@@ -4,6 +4,18 @@ Retail sales forecasting for every `(Store, Dept)` at Walmart scale. The main mo
 
 This README is written so a TA/professor can re-run the project end-to-end.
 
+
+### Team
+Bat-Amgalan Enkhtaivan
+
+Haider Khan
+
+Nigar Aliyeva
+
+Saanvi Joginipally
+
+Usha Vuchidi
+
 ---
 
 ## 1) What you need
@@ -139,7 +151,7 @@ src/
 
 ---
 
-## 6) Repro checklist (TA-friendly)
+## 6) Repro checklist
 
 - [ ] `python3 -m venv .venv && source .venv/bin/activate`
 - [ ] `pip install -r requirements.txt`
