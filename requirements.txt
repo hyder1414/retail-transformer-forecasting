@@ -1,4 +1,4 @@
-numpy>=1.26
+numpy>=1.26,<2        # torch wheels here prefer numpy 1.x
 pandas>=2.2
 pyarrow>=17.0
 polars>=1.7
@@ -6,12 +6,15 @@ duckdb>=1.1.0
 scikit-learn>=1.4
 statsmodels>=0.14
 matplotlib>=3.8
+seaborn>=0.13
+ipykernel>=6.29
+ipywidgets>=8.1
 holidays>=0.56
 
-# torch: CPU wheels available on macOS up to 2.2.x
-torch==2.2.2
-torchvision==0.17.2
-torchaudio==2.2.2
+# torch: align versions that run on macOS CPU and with numpy<2
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
 pytorch-lightning>=2.4
 
 

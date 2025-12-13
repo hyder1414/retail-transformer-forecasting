@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import torch
 import torch.nn as nn
@@ -24,6 +24,9 @@ class HAHRTConfig:
     d_ff: int = 256
     dropout: float = 0.1
     holiday_bias_strength: float = 1.5  # how strongly to bias attention toward holiday timesteps
+    use_film: bool = True               # enable hierarchical FiLM adapters
+    use_local_conv: bool = True         # short-range temporal conv added to the input stream
+    local_conv_kernel: int = 3
 
 
 class HolidayAwareSelfAttention(nn.Module):
@@ -161,8 +164,9 @@ class HAHRTModel(nn.Module):
     """
     Holiday-Aware Hierarchical Residual Transformer:
       - Input: residual + covariates sequences
+      - Optional short-range convolutional stem for local trends
       - Holiday-aware multi-head self-attention
-      - Hierarchical FiLM adapters (store/dept/type/size)
+      - Hierarchical FiLM adapters (store/dept/type/size) that can be toggled off for ablations
       - Output: residual correction for the last timestep in the window
     """
     def __init__(self, cfg: HAHRTConfig):
@@ -171,7 +175,22 @@ class HAHRTModel(nn.Module):
         d_model = cfg.d_model
 
         # Project continuous covariates into model dimension
+        self.input_norm = nn.LayerNorm(cfg.input_dim)
         self.input_proj = nn.Linear(cfg.input_dim, d_model)
+        self.use_local_conv = cfg.use_local_conv
+        if self.use_local_conv:
+            # short-range convolution to capture local spikes and smooth the series
+            padding = max(cfg.local_conv_kernel // 2, 1)
+            self.local_conv = nn.Conv1d(
+                cfg.input_dim,
+                d_model,
+                kernel_size=cfg.local_conv_kernel,
+                padding=padding,
+            )
+            self.local_conv_act = nn.GELU()
+        else:
+            self.local_conv = None
+            self.local_conv_act = None
 
         # Time embeddings
         self.week_embed = nn.Embedding(cfg.max_week_of_year + 1, d_model)
@@ -187,22 +206,31 @@ class HAHRTModel(nn.Module):
         d_type = max(d_model // 8, 4)
         d_size = max(d_model // 8, 4)
 
-        self.store_embed = nn.Embedding(cfg.num_stores, d_store)
-        self.dept_embed = nn.Embedding(cfg.num_depts, d_dept)
-        self.store_type_embed = nn.Embedding(cfg.num_store_types, d_type)
-        self.size_mlp = nn.Sequential(
-            nn.Linear(1, d_size),
-            nn.ReLU(),
-            nn.Linear(d_size, d_size),
-        )
+        self.use_film = cfg.use_film
+        if self.use_film:
+            self.store_embed = nn.Embedding(cfg.num_stores, d_store)
+            self.dept_embed = nn.Embedding(cfg.num_depts, d_dept)
+            self.store_type_embed = nn.Embedding(cfg.num_store_types, d_type)
+            self.size_mlp = nn.Sequential(
+                nn.Linear(1, d_size),
+                nn.ReLU(),
+                nn.Linear(d_size, d_size),
+            )
 
-        # Combine static embeddings into a single vector, then produce FiLM params
-        static_total_dim = d_store + d_dept + d_type + d_size
-        self.static_to_film = nn.Sequential(
-            nn.Linear(static_total_dim, d_model * 2),
-            nn.ReLU(),
-            nn.Linear(d_model * 2, d_model * 2),
-        )
+            # Combine static embeddings into a single vector, then produce FiLM params
+            static_total_dim = d_store + d_dept + d_type + d_size
+            self.static_to_film = nn.Sequential(
+                nn.Linear(static_total_dim, d_model * 2),
+                nn.ReLU(),
+                nn.Linear(d_model * 2, d_model * 2),
+            )
+        else:
+            # place-holders to keep type checkers happy; not used in forward
+            self.store_embed = None
+            self.dept_embed = None
+            self.store_type_embed = None
+            self.size_mlp = None
+            self.static_to_film = None
 
         # Stack of holiday-aware Transformer layers
         self.layers = nn.ModuleList(
@@ -219,6 +247,7 @@ class HAHRTModel(nn.Module):
         )
 
         self.dropout = nn.Dropout(cfg.dropout)
+        self.post_embed_norm = nn.LayerNorm(d_model)
 
         # Output head: predict scalar residual correction from last timestep
         self.output_head = nn.Sequential(
@@ -246,15 +275,20 @@ class HAHRTModel(nn.Module):
         year = batch["year_idx"].long()      # [B, L]
         is_holiday = batch["is_holiday"].long()  # [B, L]
 
-        store_idx = batch["store_idx"].long()  # [B]
-        dept_idx = batch["dept_idx"].long()    # [B]
-        store_type_idx = batch["store_type_idx"].long()  # [B]
-        size_norm = batch["size_norm"].unsqueeze(-1)  # [B, 1]
+        store_idx = batch.get("store_idx")
+        dept_idx = batch.get("dept_idx")
+        store_type_idx = batch.get("store_type_idx")
+        size_norm = batch.get("size_norm")
 
         B, L, _ = x_cont.shape
 
-        # 1) Project continuous covariates
-        x = self.input_proj(x_cont)  # [B, L, d_model]
+        # 1) Project continuous covariates + optional local conv for short-term spikes
+        x_norm = self.input_norm(x_cont)
+        x = self.input_proj(x_norm)  # [B, L, d_model]
+        if self.use_local_conv and self.local_conv is not None:
+            conv_feat = self.local_conv(x_norm.transpose(1, 2)).transpose(1, 2)
+            conv_feat = self.local_conv_act(conv_feat)
+            x = x + conv_feat
 
         # 2) Add time & holiday token embeddings
         week_emb = self.week_embed(week)      # [B, L, d_model]
@@ -262,17 +296,27 @@ class HAHRTModel(nn.Module):
         hol_emb = self.holiday_embed(is_holiday)  # [B, L, d_model]
 
         x = x + week_emb + year_emb + hol_emb
+        x = self.post_embed_norm(x)
         x = self.dropout(x)
 
         # 3) Build static / hierarchical embeddings and FiLM params
-        store_e = self.store_embed(store_idx)           # [B, d_store]
-        dept_e = self.dept_embed(dept_idx)              # [B, d_dept]
-        type_e = self.store_type_embed(store_type_idx)  # [B, d_type]
-        size_e = self.size_mlp(size_norm)               # [B, d_size]
+        gamma: Optional[torch.Tensor]
+        beta: Optional[torch.Tensor]
+        if self.use_film:
+            if store_idx is None or dept_idx is None or store_type_idx is None or size_norm is None:
+                raise ValueError("FiLM adapters require store/dept/type/size fields in batch.")
 
-        static_vec = torch.cat([store_e, dept_e, type_e, size_e], dim=-1)  # [B, static_total_dim]
-        film_params = self.static_to_film(static_vec)  # [B, 2 * d_model]
-        gamma, beta = torch.chunk(film_params, 2, dim=-1)  # each [B, d_model]
+            store_e = self.store_embed(store_idx.long())           # [B, d_store]
+            dept_e = self.dept_embed(dept_idx.long())              # [B, d_dept]
+            type_e = self.store_type_embed(store_type_idx.long())  # [B, d_type]
+            size_e = self.size_mlp(size_norm.unsqueeze(-1))        # [B, d_size]
+
+            static_vec = torch.cat([store_e, dept_e, type_e, size_e], dim=-1)  # [B, static_total_dim]
+            film_params = self.static_to_film(static_vec)  # [B, 2 * d_model]
+            gamma, beta = torch.chunk(film_params, 2, dim=-1)  # each [B, d_model]
+        else:
+            gamma = None
+            beta = None
 
         # 4) Pass through holiday-aware Transformer layers
         for layer in self.layers:

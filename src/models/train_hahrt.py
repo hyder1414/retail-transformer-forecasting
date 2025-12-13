@@ -1,5 +1,7 @@
 # src/models/train_hahrt.py
 import argparse
+import json
+from pathlib import Path
 from typing import Dict, Any
 
 import numpy as np
@@ -14,6 +16,10 @@ from .hahrt_data import (
 )
 from .hahrt_model import HAHRTModel, HAHRTConfig
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+REPORTS_DIR = PROJECT_ROOT / "reports" / "metrics"
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def weighted_mae_loss(
     pred: torch.Tensor, target: torch.Tensor, weight: torch.Tensor
@@ -26,6 +32,22 @@ def weighted_mae_loss(
     eps = 1e-8
     abs_err = torch.abs(pred - target)
     num = torch.sum(weight * abs_err)
+    denom = torch.sum(weight) + eps
+    return num / denom
+
+
+def weighted_mse_log_loss(
+    pred: torch.Tensor, target: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """
+    MSE in log1p space with holiday weighting.
+    This stabilizes very large sales values and complements WMAE.
+    """
+    eps = 1e-8
+    pred_c = torch.clamp(pred, min=0.0)
+    target_c = torch.clamp(target, min=0.0)
+    per_sample = (torch.log1p(pred_c) - torch.log1p(target_c)) ** 2
+    num = torch.sum(per_sample * weight)
     denom = torch.sum(weight) + eps
     return num / denom
 
@@ -55,14 +77,20 @@ def train_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    lambda_mse: float = 0.0,  # kept for CLI compatibility, unused now
-) -> float:
+    final_wmae_weight: float = 0.7,
+    lambda_log: float = 0.05,
+) -> Dict[str, float]:
     """
-    Train for one epoch using PURE weighted MAE (WMAE) on residuals.
-    Returns the average train WMAE across batches.
+    Train for one epoch optimizing a blended objective:
+      - holiday-weighted MAE on residuals
+      - holiday-weighted MAE on final prediction (baseline + residual)
+      - log-space MSE regularizer to stabilize extreme sales
+    Returns average train metrics.
     """
     model.train()
-    total_wmae = 0.0
+    total_wmae_resid = 0.0
+    total_wmae_final = 0.0
+    total_mse_log = 0.0
     num_batches = 0
 
     for batch in dataloader:
@@ -75,17 +103,36 @@ def train_epoch(
 
         target_resid = batch["target_resid"]     # [B]
         target_weight = batch["target_weight"]   # [B]
+        baseline_pred = batch["baseline_pred_target"]  # [B]
+        target_y = batch["target_y"]             # [B]
 
-        loss = weighted_mae_loss(pred_resid, target_resid, target_weight)
+        final_pred = baseline_pred + pred_resid
+
+        wmae_resid = weighted_mae_loss(pred_resid, target_resid, target_weight)
+        wmae_final = weighted_mae_loss(final_pred, target_y, target_weight)
+        mse_log_final = weighted_mse_log_loss(final_pred, target_y, target_weight)
+
+        loss = (
+            final_wmae_weight * wmae_final
+            + (1.0 - final_wmae_weight) * wmae_resid
+            + lambda_log * mse_log_final
+        )
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        total_wmae += float(loss.detach().cpu().item())
+        total_wmae_resid += float(wmae_resid.detach().cpu().item())
+        total_wmae_final += float(wmae_final.detach().cpu().item())
+        total_mse_log += float(mse_log_final.detach().cpu().item())
         num_batches += 1
 
-    return total_wmae / max(1, num_batches)
+    denom = max(1, num_batches)
+    return {
+        "wmae_resid": total_wmae_resid / denom,
+        "wmae_final": total_wmae_final / denom,
+        "mse_log": total_mse_log / denom,
+    }
 
 
 def evaluate(
@@ -95,12 +142,16 @@ def evaluate(
 ) -> Dict[str, float]:
     """
     Evaluate on validation set:
-      - WMAE on residuals
-      - WMAE on final prediction (baseline + residual)
+      - WMAE on residuals (diagnostic)
+      - WMAE on final prediction (competition metric)
+      - MAE / RMSE / MSE_log for reporting
     """
     model.eval()
     all_wmae_resid = []
     all_wmae_final = []
+    all_mae_final = []
+    all_rmse_final = []
+    all_mse_log_final = []
 
     with torch.no_grad():
         for batch in dataloader:
@@ -126,9 +177,22 @@ def evaluate(
             )
             all_wmae_final.append(wmae_final)
 
+            mae_final = torch.mean(torch.abs(final_pred - target_y)).item()
+            rmse_final = torch.sqrt(torch.mean((final_pred - target_y) ** 2)).item()
+            mse_log_final = torch.mean(
+                (torch.log1p(torch.clamp(final_pred, min=0.0)) - torch.log1p(torch.clamp(target_y, min=0.0))) ** 2
+            ).item()
+
+            all_mae_final.append(mae_final)
+            all_rmse_final.append(rmse_final)
+            all_mse_log_final.append(mse_log_final)
+
     return {
         "wmae_resid": float(np.mean(all_wmae_resid)),
         "wmae_final": float(np.mean(all_wmae_final)),
+        "mae_final": float(np.mean(all_mae_final)),
+        "rmse_final": float(np.mean(all_rmse_final)),
+        "mse_log_final": float(np.mean(all_mse_log_final)),
     }
 
 
@@ -164,10 +228,16 @@ def main():
         default=1e-3,
     )
     parser.add_argument(
-        "--lambda_mse",
+        "--final_wmae_weight",
         type=float,
-        default=0.0,
-        help="(Unused) kept for backward compatibility. Training uses pure WMAE.",
+        default=0.7,
+        help="Weight for final WMAE vs residual WMAE in the blended loss (1.0 => final only).",
+    )
+    parser.add_argument(
+        "--lambda_log",
+        type=float,
+        default=0.05,
+        help="Weight on the log-space MSE regularizer to stabilize very large sales.",
     )
     # Model hyperparameters
     parser.add_argument(
@@ -200,6 +270,16 @@ def main():
         type=float,
         default=1.5,
         help="Attention logit bias toward holiday timesteps",
+    )
+    parser.add_argument(
+        "--no_film",
+        action="store_true",
+        help="Disable hierarchical FiLM adapters (useful for ablations / baseline transformer).",
+    )
+    parser.add_argument(
+        "--no_local_conv",
+        action="store_true",
+        help="Disable the short-range convolutional stem.",
     )
 
     args = parser.parse_args()
@@ -244,36 +324,67 @@ def main():
         d_ff=args.d_ff,
         dropout=args.dropout,
         holiday_bias_strength=args.holiday_bias_strength,
+        use_film=not args.no_film,
+        use_local_conv=not args.no_local_conv,
     )
     model = HAHRTModel(cfg).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     best_val_wmae = float("inf")
+    best_epoch = -1
+    best_val_metrics: Dict[str, float] = {}
     best_model_path = DATA_DIR / "interim" / "hahrt_best_model.pt"
     best_model_path.parent.mkdir(parents=True, exist_ok=True)
+    history = []
 
     for epoch in range(1, args.epochs + 1):
-        train_wmae = train_epoch(
+        train_metrics = train_epoch(
             model,
             train_loader,
             optimizer,
             device,
-            lambda_mse=args.lambda_mse,
+            final_wmae_weight=args.final_wmae_weight,
+            lambda_log=args.lambda_log,
         )
-        metrics = evaluate(model, val_loader, device)
+        val_metrics = evaluate(model, val_loader, device)
 
         print(
             f"Epoch {epoch:02d} | "
-            f"Train WMAE (resid): {train_wmae:.2f} | "
-            f"Val WMAE (resid): {metrics['wmae_resid']:.2f} | "
-            f"Val WMAE (final): {metrics['wmae_final']:.2f}"
+            f"Train WMAE (final/resid): {train_metrics['wmae_final']:.2f} / {train_metrics['wmae_resid']:.2f} | "
+            f"Train MSE_log: {train_metrics['mse_log']:.4f} | "
+            f"Val WMAE (final/resid): {val_metrics['wmae_final']:.2f} / {val_metrics['wmae_resid']:.2f} | "
+            f"Val MAE: {val_metrics['mae_final']:.2f} | "
+            f"Val MSE_log: {val_metrics['mse_log_final']:.4f}"
         )
 
-        if metrics["wmae_final"] < best_val_wmae:
-            best_val_wmae = metrics["wmae_final"]
+        history.append(
+            {
+                "epoch": epoch,
+                "train": train_metrics,
+                "val": val_metrics,
+            }
+        )
+
+        if val_metrics["wmae_final"] < best_val_wmae:
+            best_val_wmae = val_metrics["wmae_final"]
+            best_val_metrics = val_metrics
+            best_epoch = epoch
             torch.save(model.state_dict(), best_model_path)
             print(f"  -> New best model saved to {best_model_path}")
+
+    # Persist metrics + history for the notebook/TA story
+    best_metrics_path = REPORTS_DIR / "hahrt_best_metrics.json"
+    history_path = REPORTS_DIR / "hahrt_train_history.json"
+    payload = {
+        "best_epoch": best_epoch,
+        "best_val": best_val_metrics,
+        "config": vars(args),
+    }
+    with open(best_metrics_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    with open(history_path, "w") as f:
+        json.dump(history, f, indent=2)
 
     print("Training complete.")
     print(f"Best validation WMAE (final sales): {best_val_wmae:.2f}")
